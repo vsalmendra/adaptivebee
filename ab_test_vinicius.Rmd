@@ -1,0 +1,537 @@
+---
+title: "AdaptiveBee test"
+author: "Vinicius Almendra"
+output: html_document
+---
+
+
+Initialization code
+```{r cache=F,message=F}
+library(data.table)
+library(magrittr)
+library(jsonlite)
+library(ggplot2)
+library(lubridate)
+library(caret)
+library(knitr)
+library(doMC)
+library(randomForest)
+library(scales)
+library(corrplot)
+
+registerDoMC(4) # Uses up to 4 cores for parallel computation
+
+
+knitr::opts_chunk$set(echo = TRUE, comment=NA)
+```
+
+## Code to import data and save to working files (needs enough RAM space)
+```{r eval=F}
+
+import.file = function(filename, nrows=-1) {
+  
+  cat("Reading file", filename,"\n")
+  ab0 = fread(filename, header = F, stringsAsFactors = F, verbose=T,nrows=nrows,sep="\t")
+
+  # Extract JSON field values as lists
+  cat("Extracting JSON...\n")
+  
+  js = lapply(ab0$V3, fromJSON)
+  
+  # Keeps only relevant columns
+  js = lapply(js, function(x) x[c("appInstanceUid",
+                                  "features",
+                                  "location","vertical","os")])
+  
+  # Transforms features boolean fields
+  cat("Transforming features in booleans...\n")
+  js2 = lapply(js, function(x) {
+    
+    features = x$features
+    features.vector = as.list(rep(TRUE,length((features))))
+    names(features.vector) = features
+    x$features = features.vector
+    
+    x
+  })
+  
+  # Flattens list as vectors and then transform in lists again
+  cat("Flattening lists....\n")
+  js3 = lapply(js2, unlist)
+  js4 = lapply(js3, as.list)
+  
+  # Joins everything in a single data.table
+  cat("Joining...\n")
+  js.df = rbindlist(js4, fill=T)
+  
+  cat("Fixing columns...\n")
+  # Fixes features columns
+  feat.cols = names(js.df)[grep("^features", names(js.df))]
+  js.df[,(feat.cols):=lapply(.SD[,feat.cols,with=F], 
+                             function(x) {
+                               y=as.logical(x)
+                               y[is.na(y)] = FALSE
+                               y
+                             }
+  )]
+  
+  
+  # Convert other columns to factors
+  other.cols = setdiff(names(js.df),feat.cols)
+  js.df[,(other.cols):=lapply(.SD[,other.cols,with=F], as.factor)]
+  
+  # Joins back to the main table
+  ab0.full = cbind(ab0[,-"V3",with=F],js.df)
+  
+  # Fixes field names
+  setnames(ab0.full,"V1","timestamp")
+  setnames(ab0.full,"V2","event_type")
+  setnames(ab0.full,"V4","country")
+  
+  # Parses timestamp
+  ab0.full[,timestamp:=as.POSIXct(timestamp)]
+  
+  # Other fields as factors
+  ab0.full[, event_type := as.factor(event_type)]
+  ab0.full[, country := as.factor(country)]
+  
+  ab0.full
+}
+
+
+files = list.files("test",pattern=".*\\d$",recursive=T,full.names=T)
+
+for(f in files) {
+  
+  if(!file.exists(paste0(f,".rds"))) {
+    db = import.file(f)  
+    saveRDS(db, paste0(f,".rds"))
+    rm(db)
+  }
+  gc()
+}
+
+
+# Generates set without features
+
+db.full = NULL
+for(f in files) {
+  cat(f,"\n")
+  db = readRDS(paste0(f,".rds"))
+  db[,(names(db)[grep("^features",names(db))]):=NULL]
+  db[,src := f]
+  db.full = rbind(db.full, db, fill=T)
+  rm(db)
+  print(gc())
+}
+
+# Adds an ID
+db.full[,id := 1:.N]
+db.full[,src := factor(src)]
+
+saveRDS(db.full,"test_info.rds")
+rm(db.full)
+
+features.table = list()
+total.nrows = 0
+
+# Calculates features occurrence
+for(f in files) {
+  cat(f,"\n")
+  db = readRDS(paste0(f,".rds"))
+
+  for(n in names(db)[grepl("^features",names(db))]) {
+    
+    if(is.null(features.table[[n]]))
+      features.table[[n]] = 0
+    
+    features.table[[n]] = features.table[[n]] + sum(db[[n]],
+                                                    na.rm=T)
+  }
+  
+  total.nrows = total.nrows + nrow(db)
+  
+  rm(db)
+  print(gc())
+}
+
+features.table = unlist(features.table)
+
+# Identify features that appear in more than a threshold
+features.table = features.table[features.table > 10000]
+
+selected.features = names(features.table)
+
+
+# Generates set with only features
+db.features = NULL
+for(f in files) {
+  cat(f,"\n")
+  db = readRDS(paste0(f,".rds"))
+  db = db[,intersect(names(db), selected.features),with=F]
+  
+  db.features = rbind(db.features, db, fill=T)
+  rm(db)
+  print(gc())
+}
+
+db.features[, id := 1:.N]
+saveRDS(db.features,"test_features.rds")
+
+# Joins everything
+
+db.full=readRDS("test_info.rds")
+
+db.features[,id:=NULL]
+db.all = cbind(db.full,db.features)
+
+saveRDS(db.all, "test_all.rds")
+
+rm(db.features, db.full)
+```
+
+
+
+## Basic statistics
+
+```{r}
+db = readRDS("train_info.rds")
+
+data.frame(
+  `Unique users`=format(length(levels(db$appInstanceUid)),big.mark=","),
+  `Unique beacons`=paste(levels(db$event_type),collapse=","),
+  `First event`=min(db$timestamp),
+  `Last event`=max(db$timestamp),
+  `Events`=format(nrow(db),big.mark=","),
+  check.names=F
+)
+```
+
+## User behavior
+
+### Distribution of first visit
+
+```{r}
+
+setkey(db,appInstanceUid,timestamp)
+fv = db[,.(day_first_visit=as.Date(min(timestamp)),
+           visits=.N
+           ),
+           by=appInstanceUid]
+
+ggplot(data=fv[,.N,by=day_first_visit],
+       aes(x=day_first_visit, y=N,fill=wday(day_first_visit,label=T)))+
+  geom_bar(stat="identity")
+```
+
+At first I see no reason for having a spike of users in the beginning of the month that slowly decreases. My first hypothesis is that in fact they are the recurring users: if they access the internet frequently, their first accesses will naturally cluster towards 0. After the first half of the month we probably see mostly new users (or users that use the browser less frequently). Let's focus on this period:
+
+```{r}
+ggplot(data=fv[month(day_first_visit)>=5 &
+               mday(day_first_visit) >= 15,
+               .N,
+               by=day_first_visit],
+       aes(x=day_first_visit, y=N,fill=wday(day_first_visit,label=T)))+
+  geom_bar(stat="identity")
+```
+
+
+Let's narrow our detailed analysis to these users, calculating extra stats:
+```{r}
+
+db15 = db[appInstanceUid %in% fv[month(day_first_visit)>=5 &
+               mday(day_first_visit) >= 15,appInstanceUid]]
+
+first.event = min(db15$timestamp)
+setkey(db15,appInstanceUid,timestamp,location)
+usr15 = db15[,.(
+  first_timestamp = min(timestamp),
+  date_first_visit=as.Date(min(timestamp)),
+  last_timestamp = max(timestamp),
+  date_last_visit=as.Date(max(timestamp)),
+  visits=.N),
+  by=appInstanceUid]
+
+usr15[, day_last_visit :=
+        difftime(last_timestamp,first.event,units="days") %>%
+        floor %>% as.double
+      ]
+
+usr15[, day_first_visit :=
+        difftime(first_timestamp,first.event,units="days") %>%
+        floor %>% as.double
+      ]
+
+usr15[,lifetime.days := 
+        difftime(last_timestamp, first_timestamp, units="days") %>%
+        as.double
+      ]
+```
+
+Let's see the distribution of users by lifetime
+```{r}
+ggplot(usr15, aes(x=round(usr15$lifetime.days)))+
+  geom_bar()
+```
+
+Distribution has a clear discontinuity: most users that do not come back stay a very short time.
+
+## Target definition
+
+Since there is a clear discontinuity in the dataset, we will use it as the label for classification. The objective is to **identify which features help users stay at least one day (24h)**
+
+
+```{r}
+threshold = 1
+
+usr15.1 = usr15[(max(day_last_visit) - day_first_visit) >  threshold]
+
+usr15.2 = usr15.1[, returning.user := lifetime.days > threshold]
+table(usr15.2$returning.user)
+nrow(usr15.2)
+
+```
+
+Check proportion of returning users logging for first time each day
+```{r}
+ggplot(data=usr15.2, aes(x=day_first_visit,
+                       fill=returning.user))+
+  geom_bar()
+```
+
+Now plots only the % of users that returned
+```{r}
+ggplot(usr15.2[,.(prop=sum(returning.user)/.N),
+               by=day_first_visit],
+       aes(x=day_first_visit, y=prop))+
+  geom_bar(stat="identity")+
+  ylab("% of users that returned")+
+  scale_y_continuous(labels = percent)
+```
+
+Until day 7 the proportion of returning users is quite constant.
+Afterwards we see a drop, probably because of some other effect (e.g. 
+shorter timeframe to return). So to avoid "false" non-returning users, lets reduce our set from day 0 to day 7
+
+```{r limit_to_7}
+usr15.3 = usr15.2[day_first_visit <= 7]
+table(usr15.3$returning.user)
+
+ggplot(usr15.3[,.(prop=sum(returning.user)/.N),
+               by=day_first_visit],
+       aes(x=day_first_visit, y=prop))+
+  geom_bar(stat="identity")+
+  ylab("% of users that returned")+
+  scale_y_continuous(labels = percent)
+```
+
+Class distribution:
+```{r}
+summary(usr15.3$returning.user)
+```
+
+```{r}
+rm(db)
+```
+
+
+## Predicting return based on features 
+
+Extracts set of events related to the selected users
+```{r}
+db.all = readRDS("train_all.rds")
+
+setkey(db.all,appInstanceUid)
+setkey(usr15.3, appInstanceUid)
+db0 = db.all[usr15.3[,.(appInstanceUid,returning.user,first_timestamp)],
+            nomatch=0]
+
+rm(db.all)
+
+nrow(db0)
+```
+
+
+For each user, keeps only access on the threshold period (this avoids including
+in the analysis features that are usually "used" after some time)
+```{r}
+db = db0[(difftime(timestamp,first_timestamp,units="days") %>% 
+          as.double) <= threshold]
+
+nrow(db)
+rm(db0)
+```
+
+
+Aggregates feature usage by user (% of accesses that used each feature):
+```{r}
+features = c(names(db)[grep("^feature",names(db))])
+db.melt = melt(db,
+               id.vars=c("id","appInstanceUid",
+                         "returning.user"),
+               measure.vars = features,
+               variable.name = "feature"
+               )
+
+db.melt.avg = db.melt[,.(value=mean(value)),
+                  by=.(appInstanceUid,feature,returning.user)]
+
+
+db.melt.per.label.avg = db.melt.avg[,.(value=mean(value)),
+                            by=.(feature,returning.user)]
+
+```
+
+Visualization of feature presence (per user):
+```{r fig.width=12,fig.height=12}
+ggplot(db.melt.per.label.avg, aes(x=returning.user, y=value))+
+  geom_bar(stat="identity")+
+  facet_wrap(~ feature, scales="free")+
+  scale_y_continuous(labels=percent)+
+  ggtitle("% of events that used each feature, split by category")
+```
+
+Feature presence (event counts):
+```{r fig.width=12,fig.height=12}
+dcast.data.table(
+  db.melt[,.(value=sum(value)),
+          by=.(feature, returning.user)],
+  feature ~ returning.user)
+```
+
+Feature presence (user counts - each user is counted if has at least 1 event with respective feature):
+```{r fig.width=12,fig.height=12}
+dcast.data.table(
+  db.melt[,.(value=max(value)),
+          by=.(appInstanceUid,feature,returning.user)],
+  feature ~ returning.user,fun.aggregate = sum)
+```
+
+We can see that very few features are present on a significant number of sellers and the differences are quite huge. We can expect that
+most of them won't help
+
+Builds prediction data:
+```{r}
+db.pred = 
+  dcast.data.table(db.melt.avg,
+                   appInstanceUid+returning.user ~ feature)
+db.pred[,returning.user := factor(returning.user)]
+
+features = names(db.pred)[grep("^features",names(db.pred))]
+```
+
+```{r}
+rm(db.melt,db.melt.per.label.avg)
+```
+
+
+Splits in training and test set:
+```{r}
+inTraining.idx = sample(nrow(db.pred), round(0.75*nrow(db.pred)))
+
+training <- db.pred[inTraining.idx]
+testing  <- db.pred[-inTraining.idx]
+```
+
+**Training size**: `r nrow(training)` / **Test size**: `r nrow(testing)`
+
+
+Checks class distribution training
+```{r}
+table(training$returning.user) %>% prop.table
+```
+
+```{r}
+table(testing$returning.user) %>% prop.table
+```
+
+
+Removes near-duplicate columns
+```{r}
+cormatrix=cor(training[,features,with=F])
+
+features.to.remove = findCorrelation(cormatrix, cutoff=0.9, names=T)
+features2 = setdiff(features, features.to.remove)
+```
+
+Shows correlation matrix after removal of correlated features
+```{r}
+cormatrix2=cor(training[,features2,with=F])
+
+corrplot.mixed(cormatrix2)
+```
+
+Correlation is very high among some features due to the very small numbers of users that use those features, so that most users have value of 0...
+
+
+## Training
+
+Assures reproducibility across runs
+```{r}
+set.seed(1)
+```
+
+
+Training model with parameter optimization:
+```{r rf_param_optim}
+
+fitControl <- trainControl(
+  verboseIter=T,
+  method = "repeatedcv",
+  number = 3,
+  repeats = 3)
+
+m.rf <- train(returning.user ~ ., 
+            data = training[,c(features2,"returning.user"),with=F],
+            method = "rf",
+            trControl=fitControl,
+            verbose = T)
+
+print(m.rf)
+```
+
+Testing the model:
+```{r}
+pred = predict(m.rf, testing)
+cm.rf = confusionMatrix(pred, testing$returning.user,positive="TRUE")
+
+cm.rf
+```
+
+
+
+Uses variable importance to identify best features:
+```{r}
+imp = importance(m.rf$finalModel)
+good.features  = row.names(imp)[imp>2]
+```
+
+```{r}
+print(imp[order(imp,decreasing=T),])
+cat(good.features,"\n")
+```
+
+
+Training with less variables:
+```{r rf_param_optim_less_features}
+set.seed(1)
+m.rf2 <- train(returning.user ~ ., 
+            data = training[,c(good.features,"returning.user"),with=F],
+            method = "rf",
+            trControl=fitControl,
+            verbose = T)
+
+print(m.rf2)
+```
+
+Testing the model:
+```{r}
+pred = predict(m.rf2, testing)
+cm.rf2 = confusionMatrix(pred, testing$returning.user,positive="TRUE")
+
+cm.rf2
+```
+
+## Final conclusions
+
+Features at first sight are not enough to separate well both classes of users. We have a near 60% accuracy.
